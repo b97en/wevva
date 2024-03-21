@@ -1,4 +1,4 @@
-# wevva
+![wevva logo](wevva.png)
 
 A Hive integration for the Home Assistant App.
 
