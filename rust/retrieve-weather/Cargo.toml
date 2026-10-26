@@ -1,12 +1,16 @@
 [package]
-name = "wevva"
-version = "0.1.0"
+name = "retrieve-weather"
+version = "0.2.0"
 edition = "2021"
+description = "Prints the hourly OpenWeather 'feels like' forecast as JSON for the wevva agent"
+publish = false
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-reqwest = { version = "0.11", features = ["json"] }
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-tokio = { version = "1", features = ["full"] }
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt"] }

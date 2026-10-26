@@ -1,83 +1,81 @@
-use reqwest;
-use serde::{Serialize, Deserialize};
-use std::env;
-use std::time::{SystemTime, UNIX_EPOCH, Duration};
+//! retrieve-weather prints the next few hours of OpenWeather "feels like"
+//! temperatures as JSON on stdout, for the wevva Go agent to consume.
+//!
+//! Errors go to stderr with a non-zero exit code, so the agent can tell a
+//! failed fetch apart from an empty forecast.
 
-#[derive(Deserialize, Debug)]
-struct WeatherResponse {
-    hourly: Vec<HourlyWeather>,
+mod forecast;
+mod openweather;
+
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use anyhow::{ensure, Context, Result};
+use clap::Parser;
+
+use crate::forecast::Report;
+use crate::openweather::Api;
+
+#[derive(Parser, Debug)]
+#[command(version, about)]
+struct Args {
+    /// Latitude of the home in decimal degrees.
+    #[arg(long, allow_negative_numbers = true)]
+    lat: f64,
+
+    /// Longitude of the home in decimal degrees (west of Greenwich is negative).
+    #[arg(long, allow_negative_numbers = true)]
+    lon: f64,
+
+    /// How many hours to report, starting from the current hour.
+    #[arg(long, default_value_t = 12, value_parser = clap::value_parser!(u32).range(1..=48))]
+    hours: u32,
+
+    /// Which OpenWeather API to call.
+    #[arg(long, value_enum, default_value_t = Api::Forecast)]
+    api: Api,
+
+    /// OpenWeather API key.
+    #[arg(long, env = "WEATHER_API_KEY", hide_env_values = true)]
+    api_key: String,
+
+    /// OpenWeather base URL (only useful for testing).
+    #[arg(long, default_value = openweather::BASE_URL, hide = true)]
+    base_url: String,
 }
 
-#[derive(Deserialize, Debug)]
-struct HourlyWeather {
-    dt: i64,
-    feels_like: f64, // 'Feels like' temperature in Kelvin
-}
-
-#[derive(Serialize, Debug, Clone)]
-struct DailyTemperatureReport {
-    day: String,
-    temperatures: Vec<TemperatureRecord>,
-}
-
-#[derive(Serialize, Debug, Clone)]
-struct TemperatureRecord {
-    timestamp: i64,
-    feels_like_celsius: f64,
-}
-
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() {
-    let api_key = env::var("WEATHER_API_KEY").expect("WEATHER_API_KEY not set");
-    let lat = "51.5074";
-    let lon = "0.1278";
-
-    let now = SystemTime::now();
-    let now_timestamp = now.duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
-    let yesterday_timestamp = now - Duration::from_secs(86400); // 24 hours earlier
-    let yesterday_timestamp_unix = yesterday_timestamp.duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
-
-    // Fetch today's temperatures forecast for the next 12 hours
-    let today_temperatures = fetch_day_temperatures(&api_key, lat, lon, None).await;
-
-    // Fetch yesterday's temperatures for the same 12-hour window
-    let yesterday_temperatures = fetch_day_temperatures(&api_key, lat, lon, Some(yesterday_timestamp_unix)).await;
-
-    // Combine reports
-    let reports = vec![
-        DailyTemperatureReport { day: "today".to_string(), temperatures: today_temperatures },
-        DailyTemperatureReport { day: "yesterday".to_string(), temperatures: yesterday_temperatures },
-    ];
-
-    // Serialize and print
-    if let Ok(json) = serde_json::to_string(&reports) {
-        println!("{}", json);
+    if let Err(err) = run(Args::parse()).await {
+        eprintln!("retrieve-weather: {err:#}");
+        std::process::exit(1);
     }
 }
 
-async fn fetch_day_temperatures(api_key: &str, lat: &str, lon: &str, timestamp: Option<i64>) -> Vec<TemperatureRecord> {
-    let url = match timestamp {
-        Some(ts) => format!(
-            "https://api.openweathermap.org/data/2.5/onecall/timemachine?lat={}&lon={}&dt={}&appid={}",
-            lat, lon, ts, api_key
-        ),
-        None => format!(
-            "https://api.openweathermap.org/data/2.5/onecall?lat={}&lon={}&exclude=minutely,daily,alerts&appid={}",
-            lat, lon, api_key
-        ),
+async fn run(args: Args) -> Result<()> {
+    ensure!((-90.0..=90.0).contains(&args.lat), "--lat must be between -90 and 90");
+    ensure!(
+        (-180.0..=180.0).contains(&args.lon),
+        "--lon must be between -180 and 180"
+    );
+    ensure!(!args.api_key.trim().is_empty(), "WEATHER_API_KEY is empty");
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(20))
+        .user_agent(concat!("wevva-retrieve-weather/", env!("CARGO_PKG_VERSION")))
+        .build()
+        .context("building HTTP client")?;
+
+    let samples = openweather::fetch(&client, &args.base_url, args.api, args.lat, args.lon, &args.api_key).await?;
+
+    let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
+    let report = Report {
+        provider: args.api.provider_name(),
+        latitude: args.lat,
+        longitude: args.lon,
+        generated_at: now,
+        hours: forecast::hourly(&samples, now, args.hours)?,
     };
 
-    match fetch_weather_data(&url).await {
-        Ok(data) => data.hourly.into_iter()
-            .map(|h| TemperatureRecord {
-                timestamp: h.dt,
-                feels_like_celsius: h.feels_like - 273.15,
-            })
-            .collect(),
-        Err(_) => Vec::new(),
-    }
-}
-
-async fn fetch_weather_data(url: &str) -> Result<WeatherResponse, reqwest::Error> {
-    reqwest::get(url).await?.json::<WeatherResponse>().await
+    println!("{}", serde_json::to_string(&report)?);
+    Ok(())
 }
